@@ -381,7 +381,7 @@ let state = {
   expenses: [], // {id, amount, category, date, note, ts}
   assets: [],   // {id, type, qty, rate, value, sub, source, linkedExpenseId}
   history: [],  // {key, label, salary, expenses, spent, closedAt}
-  settings: { goldPrice: '', dollarRate: '', brsApiKey: '', autoPrices: true, pricesUpdatedAt: null }
+  settings: { goldPrice: '', dollarRate: '', tindexApiToken: '', autoPrices: true, pricesUpdatedAt: null }
 };
 let nav = 'home';
 let editingExpenseCat = 'food';
@@ -447,6 +447,7 @@ async function loadState(){
   try{
     const raw = localStorage.getItem(STORAGE_KEY);
     if(raw){ state = Object.assign(state, JSON.parse(raw)); }
+    state.settings = Object.assign({ goldPrice:'', dollarRate:'', tindexApiToken:'', autoPrices:true, pricesUpdatedAt:null }, state.settings || {});
   }catch(e){ /* first run or storage unavailable - use defaults */ }
   applyMonthRollover();
   await saveState();
@@ -460,65 +461,40 @@ async function saveState(){
   catch(e){ console.error('save failed', e); }
 }
 
-/* ---------------- LIVE GOLD/DOLLAR PRICES (BrsApi.ir free keyless webservice, auto every 60s) ---------------- */
+/* ---------------- LIVE GOLD/DOLLAR PRICES (Tindex API, auto every 60s) ---------------- */
 let priceIntervalHandle = null;
-const FREE_PRICE_ENDPOINTS = [
-  'https://BrsApi.ir/FreeTsetmcBourseApi/Api_Free_Gold_Currency_v2.json',
-  'https://BrsApi.ir/FreeTsetmcBourseApi/Api_Free_Gold_Currency.json'
-];
-function normalizeList(data){
-  if(Array.isArray(data)) return data;
-  if(data && typeof data==='object'){
-    for(const k of ['gold','currency','coin','data','result','items','list']){
-      if(Array.isArray(data[k])) return data[k];
-    }
-    let merged = [];
-    Object.values(data).forEach(v=>{ if(Array.isArray(v)) merged = merged.concat(v); });
-    if(merged.length) return merged;
-  }
-  return [];
+const TINDEX_BOARDS_ENDPOINT = 'https://tindex.app/api/public/boards';
+
+function findBoardRow(boards, boardKey, slug){
+  const board = Array.isArray(boards) ? boards.find(b => b && b.key === boardKey) : null;
+  return board && Array.isArray(board.rows) ? board.rows.find(x => String(x.slug||'').toUpperCase() === slug.toUpperCase()) : null;
 }
-function findInList(list, symbolRe, nameRe){
-  return list.find(x => symbolRe.test(String(x.symbol||'')) || nameRe.test(String(x.name_en||'')+' '+String(x.name||'')));
-}
-function priceToToman(item){
-  let p = Number(String(item.price).replace(/,/g,''))||0;
-  if(/ریال|rial/i.test(item.unit||'')) p = Math.round(p/10);
-  return p;
-}
-function applyPriceData(data){
-  const list = normalizeList(data);
-  const usdItem = findInList(list, /^USD$/i, /us\s*dollar|دلار\s*آمریکا/i);
-  const goldItem = findInList(list, /gold.*18|18.*gold/i, /18\s*عیار|18k|18\s*karat/i);
+function applyTindexPriceData(data){
+  const boards = data && Array.isArray(data.data) ? data.data : [];
+  const usdItem = findBoardRow(boards, 'currency', 'USD-EXCHANGE-RATE');
+  const goldItem = findBoardRow(boards, 'gold', 'GOLD-18K');
   if(!usdItem && !goldItem) return false;
-  if(usdItem) state.settings.dollarRate = priceToToman(usdItem);
-  if(goldItem) state.settings.goldPrice = priceToToman(goldItem);
-  state.settings.pricesUpdatedAt = Date.now();
+  if(usdItem && Number(usdItem.price) > 0) state.settings.dollarRate = Math.round(Number(usdItem.price));
+  if(goldItem && Number(goldItem.price) > 0) state.settings.goldPrice = Math.round(Number(goldItem.price));
+  const timestamps = [usdItem?.updated_at, goldItem?.updated_at].filter(Boolean).map(x=>Date.parse(x)).filter(Number.isFinite);
+  state.settings.pricesUpdatedAt = timestamps.length ? Math.max(...timestamps) : Date.now();
   return true;
 }
 async function fetchLivePrices(){
-  // 1) free, keyless public endpoints — no signup needed, tried first
-  for(const url of FREE_PRICE_ENDPOINTS){
-    try{
-      const res = await fetch(url, { cache:'no-store' });
-      if(res.ok){
-        const data = await res.json();
-        if(applyPriceData(data)){ await saveState(); return { ok:true }; }
-      }
-    }catch(e){ /* try next endpoint */ }
+  const token = (state.settings.tindexApiToken||'').trim();
+  if(!token) return { ok:false, reason:'برای دریافت خودکار، توکن رایگان Tindex را وارد کنید.' };
+  try{
+    const res = await fetch(TINDEX_BOARDS_ENDPOINT, {
+      cache:'no-store',
+      headers:{ Authorization:`Bearer ${token}`, Accept:'application/json' }
+    });
+    if(!res.ok) return { ok:false, reason:`خطای API تیندکس (${res.status})` };
+    const data = await res.json();
+    if(applyTindexPriceData(data)){ await saveState(); return { ok:true }; }
+    return { ok:false, reason:'داده معتبر دلار یا طلای ۱۸ عیار از تیندکس دریافت نشد.' };
+  }catch(e){
+    return { ok:false, reason:'اتصال به تیندکس ناموفق بود (شبکه/CORS).' };
   }
-  // 2) optional advanced personal key, only used as a fallback if the free endpoints fail
-  const key = (state.settings.brsApiKey||'').trim();
-  if(key){
-    try{
-      const res = await fetch(`https://Api.BrsApi.ir/Market/Gold_Currency.php?key=${encodeURIComponent(key)}`);
-      if(res.ok){
-        const data = await res.json();
-        if(applyPriceData(data)){ await saveState(); return { ok:true }; }
-      }
-    }catch(e){ /* fall through to failure */ }
-  }
-  return { ok:false, reason:'اتصال به منابع قیمت ناموفق بود (شبکه/CORS)' };
 }
 function startPriceAutoRefresh(){
   stopPriceAutoRefresh();
@@ -530,431 +506,7 @@ function startPriceAutoRefresh(){
   }, 60000);
 }
 function stopPriceAutoRefresh(){
-  if(priceIntervalHandle){ clearInterval(priceIntervalHandle); priceIntervalHandle=null; }
-}
-
-
-/* ---------------- WEB SHARE TARGET (quick-add from a shared SMS/text) ---------------- */
-function extractAmountFromText(text){
-  const en = text
-    .replace(/[۰-۹]/g, d=>'۰۱۲۳۴۵۶۷۸۹'.indexOf(d))
-    .replace(/[٠-٩]/g, d=>'٠١٢٣٤٥٦٧٨٩'.indexOf(d));
-  const keywordRe = /(?:مبلغ|برداشت|خرید|پرداخت)[^\d]{0,12}([\d,]{4,})/;
-  const km = en.match(keywordRe);
-  if(km) return parseInt(km[1].replace(/,/g,''),10) || 0;
-  const withoutBalance = en.replace(/موجودی[^\d]{0,12}[\d,]{4,}/g, '');
-  const matches = withoutBalance.match(/[\d,]{4,}/g);
-  if(!matches) return 0;
-  const nums = matches.map(m=>parseInt(m.replace(/,/g,''),10)).filter(n=>!isNaN(n)&&n>0);
-  return nums.length ? Math.min(...nums) : 0;
-}
-function getSharedExpenseFromURL(){
-  const params = new URLSearchParams(location.search);
-  const shared = params.get('text') || params.get('title') || '';
-  if(!shared || !shared.trim()) return null;
-  history.replaceState({}, '', location.pathname);
-  const raw = shared.trim();
-  return { amount: extractAmountFromText(raw), note: raw.length>80 ? raw.slice(0,80)+'…' : raw, shared:true };
-}
-
-/* ---------------- DERIVED ---------------- */
-function totalSpent(){ return state.expenses.reduce((s,e)=>s+Number(e.amount||0),0); }
-function remaining(){ return Number(state.salary||0) - totalSpent(); }
-function totalAssets(){ return state.assets.reduce((s,a)=>s+Number(a.value||0),0); }
-function catTotals(){
-  const t = {};
-  Object.keys(CATS).forEach(k=>t[k]=0);
-  state.expenses.forEach(e=> t[e.category] = (t[e.category]||0) + Number(e.amount||0));
-  return t;
-}
-function currentMonthRecord(){
-  return { label: state.monthLabel, salary: state.salary, expenses: state.expenses, spent: totalSpent() };
-}
-
-/* ---------------- TOAST ---------------- */
-function showToast(msg){
-  let t = document.getElementById('toast');
-  if(!t){ t=document.createElement('div'); t.id='toast'; t.className='toast'; document.getElementById('phone').appendChild(t); }
-  t.textContent = msg;
-  t.classList.add('show');
-  clearTimeout(window.__toastTimer);
-  window.__toastTimer = setTimeout(()=> t.classList.remove('show'), 1800);
-}
-
-/* ---------------- MONTH REPORT: COPY & PRINT ---------------- */
-function buildMonthReportText(record){
-  const spent = record.spent!=null ? record.spent : (record.expenses||[]).reduce((s,e)=>s+Number(e.amount||0),0);
-  const rem = Number(record.salary||0) - spent;
-  const totals = {};
-  CAT_ORDER.forEach(k=>totals[k]=0);
-  (record.expenses||[]).forEach(e=> totals[e.category] = (totals[e.category]||0) + Number(e.amount||0));
-  const lines = [];
-  lines.push(`گزارش مالی موناتا — ${record.label}`);
-  lines.push('');
-  lines.push(`حقوق: ${fa(record.salary)} تومان`);
-  lines.push(`خرج‌شده: ${fa(spent)} تومان`);
-  lines.push(`باقی‌مانده: ${fa(rem)} تومان`);
-  const catLines = CAT_ORDER.filter(k=>totals[k]>0).map(k=>{
-    const v = totals[k]; const pct = spent>0? Math.round(v/spent*100):0;
-    return `- ${CATS[k].label}: ${fa(v)} تومان (${fa(pct)}٪)`;
-  });
-  if(catLines.length){ lines.push(''); lines.push('تفکیک دسته‌بندی:'); lines.push(...catLines); }
-  const sorted = [...(record.expenses||[])].sort((a,b)=>(b.ts||0)-(a.ts||0));
-  if(sorted.length){
-    lines.push(''); lines.push('تراکنش‌ها:');
-    sorted.forEach(e=>{
-      const c = CATS[e.category]||CATS.other;
-      lines.push(`${e.date} — ${c.label} — ${fa(e.amount)} تومان${e.note? ' — '+e.note : ''}`);
-    });
-  }
-  return lines.join('\n');
-}
-
-async function copyMonthReport(record){
-  const text = buildMonthReportText(record);
-  try{ await navigator.clipboard.writeText(text); return true; }
-  catch(e){
-    try{
-      const ta = document.createElement('textarea');
-      ta.value = text; ta.style.position='fixed'; ta.style.opacity='0';
-      document.body.appendChild(ta); ta.select();
-      const ok = document.execCommand('copy');
-      document.body.removeChild(ta);
-      return ok;
-    }catch(e2){ return false; }
-  }
-}
-
-function buildMonthReportHTML(record){
-  const spent = record.spent!=null ? record.spent : (record.expenses||[]).reduce((s,e)=>s+Number(e.amount||0),0);
-  const rem = Number(record.salary||0) - spent;
-  const totals = {};
-  CAT_ORDER.forEach(k=>totals[k]=0);
-  (record.expenses||[]).forEach(e=> totals[e.category] = (totals[e.category]||0) + Number(e.amount||0));
-  const sorted = [...(record.expenses||[])].sort((a,b)=>(b.ts||0)-(a.ts||0));
-  const rows = sorted.map(e=>{
-    const c = CATS[e.category]||CATS.other;
-    return `<tr><td style="padding:8px;border:1px solid #eee;">${e.date}</td><td style="padding:8px;border:1px solid #eee;">${c.label}</td><td style="padding:8px;border:1px solid #eee;">${e.note||'—'}</td><td style="padding:8px;border:1px solid #eee;">${fa(e.amount)} تومان</td></tr>`;
-  }).join('');
-  const catRows = CAT_ORDER.filter(k=>totals[k]>0).map(k=>{
-    const v = totals[k]; const pct = spent>0? Math.round(v/spent*100):0;
-    return `<tr><td style="padding:8px;border:1px solid #eee;">${CATS[k].label}</td><td style="padding:8px;border:1px solid #eee;">${fa(v)} تومان</td><td style="padding:8px;border:1px solid #eee;">${fa(pct)}٪</td></tr>`;
-  }).join('');
-  return `
-    <div style="font-family:'Vazirmatn',sans-serif; direction:rtl; color:#0f2027;">
-      <div style="display:flex;justify-content:space-between;align-items:center;border-bottom:2px solid #0d9488;padding-bottom:12px;margin-bottom:18px;">
-        <div style="font-size:20px;font-weight:800;color:#0d9488;">موناتا</div>
-        <div style="font-size:14px;font-weight:700;color:#333;">گزارش مالی — ${record.label}</div>
-      </div>
-      <div style="display:flex;gap:14px;margin-bottom:22px;">
-        <div style="flex:1;border:1px solid #ddd;border-radius:10px;padding:12px;text-align:center;">
-          <div style="font-size:11px;color:#777;">حقوق</div><div style="font-size:16px;font-weight:800;margin-top:4px;">${fa(record.salary)} تومان</div>
-        </div>
-        <div style="flex:1;border:1px solid #ddd;border-radius:10px;padding:12px;text-align:center;">
-          <div style="font-size:11px;color:#777;">خرج‌شده</div><div style="font-size:16px;font-weight:800;margin-top:4px;">${fa(spent)} تومان</div>
-        </div>
-        <div style="flex:1;border:1px solid #ddd;border-radius:10px;padding:12px;text-align:center;">
-          <div style="font-size:11px;color:#777;">باقی‌مانده</div><div style="font-size:16px;font-weight:800;margin-top:4px;color:${rem<0?'#ef4444':'#0d9488'};">${fa(rem)} تومان</div>
-        </div>
-      </div>
-      ${catRows? `<div style="font-size:13px;font-weight:800;margin-bottom:8px;">تفکیک دسته‌بندی</div>
-      <table style="width:100%;border-collapse:collapse;margin-bottom:22px;font-size:12.5px;">
-        <thead><tr style="background:#f1f6f6;"><th style="text-align:right;padding:8px;border:1px solid #eee;">دسته</th><th style="text-align:right;padding:8px;border:1px solid #eee;">مبلغ</th><th style="text-align:right;padding:8px;border:1px solid #eee;">درصد</th></tr></thead>
-        <tbody>${catRows}</tbody>
-      </table>` : ''}
-      ${rows? `<div style="font-size:13px;font-weight:800;margin-bottom:8px;">تراکنش‌ها</div>
-      <table style="width:100%;border-collapse:collapse;font-size:12px;">
-        <thead><tr style="background:#f1f6f6;"><th style="text-align:right;padding:8px;border:1px solid #eee;">تاریخ</th><th style="text-align:right;padding:8px;border:1px solid #eee;">دسته</th><th style="text-align:right;padding:8px;border:1px solid #eee;">یادداشت</th><th style="text-align:right;padding:8px;border:1px solid #eee;">مبلغ</th></tr></thead>
-        <tbody>${rows}</tbody>
-      </table>` : `<div style="color:#999;font-size:13px;">هزینه‌ای ثبت نشده بود</div>`}
-      <div style="margin-top:26px;font-size:10.5px;color:#999;text-align:center;">تولید شده توسط اپلیکیشن موناتا</div>
-    </div>
-  `;
-}
-
-function printMonthReport(record){
-  document.getElementById('printArea').innerHTML = buildMonthReportHTML(record);
-  window.print();
-}
-
-/* ---------------- RENDER: SCREENS ---------------- */
-function render(){
-  const el = document.getElementById('screen');
-  if(nav==='home') el.innerHTML = renderHome();
-  else if(nav==='expenses') el.innerHTML = renderExpensesList();
-  else if(nav==='assets') el.innerHTML = renderAssets();
-  else if(nav==='profile') el.innerHTML = renderProfile();
-  document.querySelectorAll('.nav-item').forEach(b=>{
-    b.classList.toggle('active', b.dataset.nav===nav);
-  });
-  bindScreenEvents();
-}
-
-function donutSVG(totals, total){
-  const r=40, cx=52, cy=52, circ=2*Math.PI*r;
-  let offset=0, segs='';
-  if(total>0){
-    CAT_ORDER.forEach(k=>{
-      const v = totals[k]||0;
-      if(v<=0) return;
-      const frac = v/total;
-      const len = frac*circ;
-      segs += `<circle cx="${cx}" cy="${cy}" r="${r}" fill="none" stroke="${CATS[k].color}" stroke-width="13"
-        stroke-dasharray="${len} ${circ-len}" stroke-dashoffset="${-offset}" transform="rotate(-90 ${cx} ${cy})" stroke-linecap="butt"/>`;
-      offset += len;
-    });
-  } else {
-    segs = `<circle cx="${cx}" cy="${cy}" r="${r}" fill="none" stroke="#e3eeed" stroke-width="13"/>`;
-  }
-  return `<svg width="104" height="104" viewBox="0 0 104 104">${segs}</svg>`;
-}
-
-function renderHome(){
-  const spent = totalSpent();
-  const rem = remaining();
-  const totals = catTotals();
-  const anySpend = spent>0;
-  const recent = [...state.expenses].sort((a,b)=> (b.ts||0)-(a.ts||0)).slice(0,4);
-
-  return `
-  <div class="fadein">
-    <div class="topbar px">
-      <button class="icon-btn"><span>${ic('bell',18)}</span></button>
-      <h1>خانه</h1>
-      <button class="icon-btn"><span>${ic('menu',18)}</span></button>
-    </div>
-    <div class="px">
-      <div class="hero-card">
-        <div class="hero-top">
-          <div>
-            <div class="hero-label">حقوق ماه — ${state.monthLabel}</div>
-            <div class="hero-amount">${fa(state.salary)}<span class="hero-unit">تومان</span></div>
-          </div>
-          <button class="hero-edit" id="editSalaryBtn">${ic('pencil',15)}</button>
-        </div>
-      </div>
-
-      <div class="stat-row">
-        <div class="stat-card">
-          <div class="lbl">باقی‌مانده</div>
-          <div class="val ${rem<0?'neg':'pos'}">${fa(rem)}</div>
-        </div>
-        <div class="stat-card">
-          <div class="lbl">خرج‌شده</div>
-          <div class="val">${fa(spent)}</div>
-        </div>
-      </div>
-
-      <div class="section-title">
-        <h2>گزارش هزینه‌ها</h2>
-        <div style="display:flex;gap:6px;">
-          <button class="icon-btn" id="copyMonthBtn" style="width:32px;height:32px;" title="کپی گزارش">${ic('copy',15)}</button>
-          <button class="icon-btn" id="printMonthBtn" style="width:32px;height:32px;" title="چاپ گزارش">${ic('printer',15)}</button>
-        </div>
-      </div>
-      <div class="panel">
-        <div class="donut-wrap">
-          ${donutSVG(totals, spent)}
-          <div class="legend">
-            ${CAT_ORDER.map(k=>{
-              const v = totals[k]||0;
-              const pct = anySpend ? Math.round(v/spent*100) : 0;
-              return `<div class="legend-row"><div class="legend-left"><span class="dot" style="background:${CATS[k].color}"></span><span class="legend-name">${CATS[k].label}</span></div><span class="legend-pct">${fa(pct)}٪</span></div>`;
-            }).join('')}
-          </div>
-        </div>
-        ${!anySpend?`<div class="empty-hint">هنوز هزینه‌ای ثبت نشده</div>`:''}
-      </div>
-
-      <div class="section-title"><h2>تراکنش‌های اخیر</h2><button class="link-btn" data-nav-to="expenses">مشاهده همه</button></div>
-      <div class="panel" style="padding:6px 14px;">
-        ${recent.length? recent.map(e=>txRow(e)).join('') : `<div class="empty-hint">${ic('wallet',26,'var(--muted-2)')}<div style="margin-top:8px;">با دکمه + یک هزینه ثبت کن</div></div>`}
-      </div>
-    </div>
-  </div>`;
-}
-
-function txRow(e, readonly=false){
-  const c = CATS[e.category] || CATS.other;
-  return `<div class="tx-row" data-tx="${e.id}">
-    <div class="tx-icon" style="background:${c.bg};color:${c.color}">${ic(c.icon,19)}</div>
-    <div class="tx-mid">
-      <div class="tx-name">${e.note || c.label}</div>
-      <div class="tx-sub">${e.note? c.label+' · ':''}${e.date}</div>
-    </div>
-    <div class="tx-amt">${fa(e.amount)} <span style="font-weight:600;font-size:11px;color:var(--muted)">تومان</span></div>
-    ${readonly? '' : `<button class="tx-del" data-del-tx="${e.id}">${ic('trash',15)}</button>`}
-  </div>`;
-}
-
-function renderExpensesList(){
-  const list = [...state.expenses].sort((a,b)=> (b.ts||0)-(a.ts||0));
-  return `
-  <div class="fadein">
-    <div class="topbar px">
-      <button class="icon-btn"><span>${ic('menu',18)}</span></button>
-      <h1>هزینه‌ها</h1>
-      <div style="width:38px"></div>
-    </div>
-    <div class="px">
-      <div class="stat-row" style="margin-bottom:18px;">
-        <div class="stat-card"><div class="lbl">جمع هزینه‌ها</div><div class="val">${fa(totalSpent())}</div></div>
-        <div class="stat-card"><div class="lbl">تعداد</div><div class="val">${fa(list.length)}</div></div>
-      </div>
-      <div class="panel" style="padding:6px 14px;">
-        ${list.length? list.map(e=>txRow(e)).join('') : `<div class="empty-hint">${ic('list',26,'var(--muted-2)')}<div style="margin-top:8px;">هنوز هزینه‌ای ثبت نکرده‌ای</div></div>`}
-      </div>
-    </div>
-  </div>`;
-}
-
-function renderAssets(){
-  const total = totalAssets();
-  return `
-  <div class="fadein">
-    <div class="topbar px">
-      <div style="width:38px"></div>
-      <h1>دارایی‌ها</h1>
-      <button class="icon-btn"><span>${ic('menu',18)}</span></button>
-    </div>
-    <div class="px">
-      <div class="total-hero">
-        <div class="total-top">
-          <div>
-            <div class="hero-label">ارزش کل دارایی‌ها</div>
-            <div class="hero-amount">${fa(total)}<span class="hero-unit">تومان</span></div>
-          </div>
-          <div class="total-icon">${ic('layers',22)}</div>
-        </div>
-      </div>
-
-      ${state.settings.autoPrices!==false ? `
-      <div class="panel" style="margin:16px 0;padding:12px 16px;display:flex;justify-content:space-between;align-items:center;">
-        <div style="font-size:11.5px;color:var(--muted);line-height:1.9;">
-          ${state.settings.pricesUpdatedAt ? `نرخ لحظه‌ای — طلا: <b style="color:var(--ink)">${fa(state.settings.goldPrice)}</b> · دلار: <b style="color:var(--ink)">${fa(state.settings.dollarRate)}</b><br>بروزرسانی خودکار: ${new Date(state.settings.pricesUpdatedAt).toLocaleTimeString('fa-IR')}` : 'در حال دریافت نرخ لحظه‌ای...'}
-        </div>
-        <button class="icon-btn" id="refreshPricesBtn" style="width:32px;height:32px;flex-shrink:0;">${ic('refresh',15)}</button>
-      </div>` : ''}
-
-      <div class="section-title"><h2>موارد ثبت‌شده</h2></div>
-      ${state.assets.length? state.assets.map(assetCard).join('') :
-        `<div class="panel"><div class="empty-hint">${ic('gold',26,'var(--muted-2)')}<div style="margin-top:8px;">هنوز دارایی‌ای اضافه نکرده‌ای</div></div></div>`}
-
-      <button class="primary-btn" id="addAssetBtn" style="margin-top:6px;">${ic('plus',17)} افزودن دارایی</button>
-    </div>
-  </div>`;
-}
-
-function assetCard(a){
-  const t = ATYPES[a.type] || ATYPES.cash;
-  return `<div class="asset-card" data-asset="${a.id}">
-    <div class="asset-icon" style="background:${t.bg};color:${t.color}">${ic(t.icon,21)}</div>
-    <div class="asset-mid">
-      <div class="asset-name">${t.label}</div>
-      <div class="asset-sub">${a.sub||''}</div>
-    </div>
-    <div class="asset-val">${fa(a.value)}<div style="font-size:10.5px;color:var(--muted);font-weight:600;text-align:left;">تومان</div></div>
-  </div>`;
-}
-
-function renderProfile(){
-  return `
-  <div class="fadein">
-    <div class="topbar px">
-      <div style="width:38px"></div>
-      <h1>پروفایل</h1>
-      <button class="icon-btn"><span>${ic('menu',18)}</span></button>
-    </div>
-    <div class="px">
-      <div class="profile-hero">
-        <button class="icon-btn" id="editNameBtn" style="order:3;">${ic('pencil',15)}</button>
-        <div style="flex:1;">
-          <div style="font-size:15.5px;font-weight:800;">${state.name}</div>
-          <div style="font-size:12px;color:var(--muted);margin-top:3px;">مدیریت مالی شخصی</div>
-        </div>
-        <div class="avatar">${ic('user',26)}</div>
-      </div>
-
-      <div class="menu-list">
-        <div class="menu-row" id="editSalaryBtn2">
-          <div class="menu-left"><div class="menu-ic">${ic('wallet',17)}</div>اطلاعات حقوق</div>
-          ${ic('chevL',16,'var(--muted-2)')}
-        </div>
-        <div class="menu-row" id="editRatesBtn">
-          <div class="menu-left"><div class="menu-ic">${ic('gear',17)}</div>نرخ پیش‌فرض طلا و دلار</div>
-          ${ic('chevL',16,'var(--muted-2)')}
-        </div>
-        <div class="menu-row" data-nav-to="expenses">
-          <div class="menu-left"><div class="menu-ic">${ic('tag',17)}</div>دسته‌بندی هزینه‌ها</div>
-          ${ic('chevL',16,'var(--muted-2)')}
-        </div>
-        <div class="menu-row" id="historyBtn">
-          <div class="menu-left"><div class="menu-ic">${ic('calendar',17)}</div>تاریخچه ماه‌ها</div>
-          ${ic('chevL',16,'var(--muted-2)')}
-        </div>
-        <div class="menu-row" data-nav-to="assets">
-          <div class="menu-left"><div class="menu-ic">${ic('chart',17)}</div>گزارش دارایی‌ها</div>
-          ${ic('chevL',16,'var(--muted-2)')}
-        </div>
-        <div class="menu-row">
-          <div class="menu-left"><div class="menu-ic">${ic('shield',17)}</div>حریم خصوصی و امنیت</div>
-          ${ic('chevL',16,'var(--muted-2)')}
-        </div>
-        <div class="menu-row">
-          <div class="menu-left"><div class="menu-ic">${ic('info',17)}</div>درباره موناتا</div>
-          ${ic('chevL',16,'var(--muted-2)')}
-        </div>
-      </div>
-
-      <button class="ghost-btn" id="resetBtn">${ic('refresh',15)} پاک‌کردن همه اطلاعات</button>
-    </div>
-  </div>`;
-}
-
-/* ---------------- MODALS ---------------- */
-function openSheet(html){
-  document.getElementById('sheet').innerHTML = `<div class="sheet-handle"></div>${html}`;
-  document.getElementById('overlay').classList.add('show');
-}
-function closeSheet(){
-  document.getElementById('overlay').classList.remove('show');
-}
-document.getElementById('overlay').addEventListener('click', (e)=>{
-  if(e.target.id==='overlay') closeSheet();
-});
-
-function sheetEditSalary(){
-  openSheet(`
-    <div class="sheet-head"><h3>ویرایش حقوق ماهانه</h3><button class="icon-btn" id="closeSheetBtn">${ic('x',16)}</button></div>
-    <div class="field">
-      <label>مبلغ حقوق (تومان)</label>
-      <input type="number" inputmode="numeric" class="amount-input" id="salaryInput" value="${state.salary||''}" placeholder="۰">
-    </div>
-    <button class="primary-btn" id="saveSalaryBtn">${ic('check',17)} ذخیره</button>
-  `);
-  bindSheetCommon();
-  document.getElementById('saveSalaryBtn').onclick = async ()=>{
-    const v = Number(document.getElementById('salaryInput').value)||0;
-    state.salary = v;
-    await saveState(); closeSheet(); render();
-  };
-}
-
-function sheetEditName(){
-  openSheet(`
-    <div class="sheet-head"><h3>ویرایش نام</h3><button class="icon-btn" id="closeSheetBtn">${ic('x',16)}</button></div>
-    <div class="field">
-      <label>نام نمایشی</label>
-      <input type="text" class="text-input" id="nameInput" value="${state.name}">
-    </div>
-    <button class="primary-btn" id="saveNameBtn">${ic('check',17)} ذخیره</button>
-  `);
-  bindSheetCommon();
-  document.getElementById('saveNameBtn').onclick = async ()=>{
-    const v = document.getElementById('nameInput').value.trim();
-    state.name = v || state.name;
-    await saveState(); closeSheet(); render();
-  };
+  if(priceIntervalHandle){ clearInterval(priceIntervalHandle); priceIntervalHandle = null; }
 }
 
 function sheetEditRates(){
@@ -978,13 +530,13 @@ function sheetEditRates(){
 
     <div class="field"><label>قیمت هر گرم طلا (تومان)</label><input type="number" class="text-input" id="goldRateInput" value="${state.settings.goldPrice||''}" placeholder="مثلاً ۸۰۰۰۰۰۰"></div>
     <div class="field"><label>نرخ هر دلار (تومان)</label><input type="number" class="text-input" id="dollarRateInput" value="${state.settings.dollarRate||''}" placeholder="مثلاً ۱۶۵۰۰۰۰"></div>
-    <div style="font-size:11px;color:var(--muted-2);margin-bottom:18px;line-height:1.8;">این دو عدد به‌صورت خودکار از بازار آزاد به‌روز می‌شن. اگر دریافت خودکار قطع بود یا خواستی خودت عدد دلخواه بدی، همین‌جا دستی ویرایششون کن.</div>
+    <div style="font-size:11px;color:var(--muted-2);margin-bottom:18px;line-height:1.8;">این دو عدد از API تیندکس و بر اساس تومان دریافت می‌شن. در صورت قطع API، آخرین قیمت ذخیره‌شده باقی می‌مونه و می‌تونی دستی هم ویرایششون کنی.</div>
 
-    <div id="advToggleRow" style="font-size:12px;color:var(--teal-700);font-weight:700;cursor:pointer;margin-bottom:14px;">تنظیمات پیشرفته (کلید اختصاصی) ${ic('chevL',13)}</div>
+    <div id="advToggleRow" style="font-size:12px;color:var(--teal-700);font-weight:700;cursor:pointer;margin-bottom:14px;">تنظیمات API ${ic('chevL',13)}</div>
     <div id="advBox" style="display:none;">
       <div class="field">
-        <label>کلید اختصاصی BrsApi (اختیاری — فقط برای پایداری بیشتر)</label>
-        <input type="text" class="text-input" id="apiKeyInput" value="${state.settings.brsApiKey||''}" placeholder="در حالت عادی لازم نیست" dir="ltr" style="text-align:left;">
+        <label>توکن Tindex</label>
+        <input type="text" class="text-input" id="apiKeyInput" value="${state.settings.tindexApiToken||''}" placeholder="توکن رایگان Tindex را وارد کنید" dir="ltr" style="text-align:left;">
       </div>
     </div>
 
@@ -1002,7 +554,7 @@ function sheetEditRates(){
     box.style.display = box.style.display==='none' ? 'block' : 'none';
   };
   document.getElementById('saveRatesBtn').onclick = async ()=>{
-    state.settings.brsApiKey = (document.getElementById('apiKeyInput')?.value||'').trim();
+    state.settings.tindexApiToken = (document.getElementById('apiKeyInput')?.value||'').trim();
     state.settings.goldPrice = Number(document.getElementById('goldRateInput').value)||'';
     state.settings.dollarRate = Number(document.getElementById('dollarRateInput').value)||'';
     await saveState(); closeSheet();
