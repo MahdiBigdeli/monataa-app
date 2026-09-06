@@ -381,7 +381,7 @@ let state = {
   expenses: [], // {id, amount, category, date, note, ts}
   assets: [],   // {id, type, qty, rate, value, sub, source, linkedExpenseId}
   history: [],  // {key, label, salary, expenses, spent, closedAt}
-  settings: { goldPrice: '', dollarRate: '' }
+  settings: { goldPrice: '', dollarRate: '', brsApiKey: '', autoPrices: true, pricesUpdatedAt: null }
 };
 let nav = 'home';
 let editingExpenseCat = 'food';
@@ -451,10 +451,110 @@ async function loadState(){
   applyMonthRollover();
   await saveState();
   render();
+  startPriceAutoRefresh();
+  const shared = getSharedExpenseFromURL();
+  if(shared) sheetAddExpense(shared);
 }
 async function saveState(){
   try{ localStorage.setItem(STORAGE_KEY, JSON.stringify(state)); }
   catch(e){ console.error('save failed', e); }
+}
+
+/* ---------------- LIVE GOLD/DOLLAR PRICES (BrsApi.ir free keyless webservice, auto every 60s) ---------------- */
+let priceIntervalHandle = null;
+const FREE_PRICE_ENDPOINTS = [
+  'https://BrsApi.ir/FreeTsetmcBourseApi/Api_Free_Gold_Currency_v2.json',
+  'https://BrsApi.ir/FreeTsetmcBourseApi/Api_Free_Gold_Currency.json'
+];
+function normalizeList(data){
+  if(Array.isArray(data)) return data;
+  if(data && typeof data==='object'){
+    for(const k of ['gold','currency','coin','data','result','items','list']){
+      if(Array.isArray(data[k])) return data[k];
+    }
+    let merged = [];
+    Object.values(data).forEach(v=>{ if(Array.isArray(v)) merged = merged.concat(v); });
+    if(merged.length) return merged;
+  }
+  return [];
+}
+function findInList(list, symbolRe, nameRe){
+  return list.find(x => symbolRe.test(String(x.symbol||'')) || nameRe.test(String(x.name_en||'')+' '+String(x.name||'')));
+}
+function priceToToman(item){
+  let p = Number(String(item.price).replace(/,/g,''))||0;
+  if(/ریال|rial/i.test(item.unit||'')) p = Math.round(p/10);
+  return p;
+}
+function applyPriceData(data){
+  const list = normalizeList(data);
+  const usdItem = findInList(list, /^USD$/i, /us\s*dollar|دلار\s*آمریکا/i);
+  const goldItem = findInList(list, /gold.*18|18.*gold/i, /18\s*عیار|18k|18\s*karat/i);
+  if(!usdItem && !goldItem) return false;
+  if(usdItem) state.settings.dollarRate = priceToToman(usdItem);
+  if(goldItem) state.settings.goldPrice = priceToToman(goldItem);
+  state.settings.pricesUpdatedAt = Date.now();
+  return true;
+}
+async function fetchLivePrices(){
+  // 1) free, keyless public endpoints — no signup needed, tried first
+  for(const url of FREE_PRICE_ENDPOINTS){
+    try{
+      const res = await fetch(url, { cache:'no-store' });
+      if(res.ok){
+        const data = await res.json();
+        if(applyPriceData(data)){ await saveState(); return { ok:true }; }
+      }
+    }catch(e){ /* try next endpoint */ }
+  }
+  // 2) optional advanced personal key, only used as a fallback if the free endpoints fail
+  const key = (state.settings.brsApiKey||'').trim();
+  if(key){
+    try{
+      const res = await fetch(`https://Api.BrsApi.ir/Market/Gold_Currency.php?key=${encodeURIComponent(key)}`);
+      if(res.ok){
+        const data = await res.json();
+        if(applyPriceData(data)){ await saveState(); return { ok:true }; }
+      }
+    }catch(e){ /* fall through to failure */ }
+  }
+  return { ok:false, reason:'اتصال به منابع قیمت ناموفق بود (شبکه/CORS)' };
+}
+function startPriceAutoRefresh(){
+  stopPriceAutoRefresh();
+  if(state.settings.autoPrices===false) return;
+  fetchLivePrices().then(()=> render());
+  priceIntervalHandle = setInterval(async ()=>{
+    await fetchLivePrices();
+    render();
+  }, 60000);
+}
+function stopPriceAutoRefresh(){
+  if(priceIntervalHandle){ clearInterval(priceIntervalHandle); priceIntervalHandle=null; }
+}
+
+
+/* ---------------- WEB SHARE TARGET (quick-add from a shared SMS/text) ---------------- */
+function extractAmountFromText(text){
+  const en = text
+    .replace(/[۰-۹]/g, d=>'۰۱۲۳۴۵۶۷۸۹'.indexOf(d))
+    .replace(/[٠-٩]/g, d=>'٠١٢٣٤٥٦٧٨٩'.indexOf(d));
+  const keywordRe = /(?:مبلغ|برداشت|خرید|پرداخت)[^\d]{0,12}([\d,]{4,})/;
+  const km = en.match(keywordRe);
+  if(km) return parseInt(km[1].replace(/,/g,''),10) || 0;
+  const withoutBalance = en.replace(/موجودی[^\d]{0,12}[\d,]{4,}/g, '');
+  const matches = withoutBalance.match(/[\d,]{4,}/g);
+  if(!matches) return 0;
+  const nums = matches.map(m=>parseInt(m.replace(/,/g,''),10)).filter(n=>!isNaN(n)&&n>0);
+  return nums.length ? Math.min(...nums) : 0;
+}
+function getSharedExpenseFromURL(){
+  const params = new URLSearchParams(location.search);
+  const shared = params.get('text') || params.get('title') || '';
+  if(!shared || !shared.trim()) return null;
+  history.replaceState({}, '', location.pathname);
+  const raw = shared.trim();
+  return { amount: extractAmountFromText(raw), note: raw.length>80 ? raw.slice(0,80)+'…' : raw, shared:true };
 }
 
 /* ---------------- DERIVED ---------------- */
@@ -728,6 +828,14 @@ function renderAssets(){
         </div>
       </div>
 
+      ${state.settings.autoPrices!==false ? `
+      <div class="panel" style="margin:16px 0;padding:12px 16px;display:flex;justify-content:space-between;align-items:center;">
+        <div style="font-size:11.5px;color:var(--muted);line-height:1.9;">
+          ${state.settings.pricesUpdatedAt ? `نرخ لحظه‌ای — طلا: <b style="color:var(--ink)">${fa(state.settings.goldPrice)}</b> · دلار: <b style="color:var(--ink)">${fa(state.settings.dollarRate)}</b><br>بروزرسانی خودکار: ${new Date(state.settings.pricesUpdatedAt).toLocaleTimeString('fa-IR')}` : 'در حال دریافت نرخ لحظه‌ای...'}
+        </div>
+        <button class="icon-btn" id="refreshPricesBtn" style="width:32px;height:32px;flex-shrink:0;">${ic('refresh',15)}</button>
+      </div>` : ''}
+
       <div class="section-title"><h2>موارد ثبت‌شده</h2></div>
       ${state.assets.length? state.assets.map(assetCard).join('') :
         `<div class="panel"><div class="empty-hint">${ic('gold',26,'var(--muted-2)')}<div style="margin-top:8px;">هنوز دارایی‌ای اضافه نکرده‌ای</div></div></div>`}
@@ -850,17 +958,55 @@ function sheetEditName(){
 }
 
 function sheetEditRates(){
+  const updatedTxt = state.settings.pricesUpdatedAt ? new Date(state.settings.pricesUpdatedAt).toLocaleTimeString('fa-IR') : 'هنوز دریافت نشده';
+  const statusOk = !!state.settings.pricesUpdatedAt;
   openSheet(`
-    <div class="sheet-head"><h3>نرخ پیش‌فرض</h3><button class="icon-btn" id="closeSheetBtn">${ic('x',16)}</button></div>
+    <div class="sheet-head"><h3>نرخ طلا و دلار</h3><button class="icon-btn" id="closeSheetBtn">${ic('x',16)}</button></div>
+
+    <div class="panel" style="margin-bottom:16px;padding:14px 16px;display:flex;align-items:center;gap:12px;">
+      <div class="tx-icon" style="background:${statusOk?'var(--teal-100)':'#fef3e2'};color:${statusOk?'var(--teal-700)':'var(--amber)'};flex-shrink:0;">${ic(statusOk?'check':'refresh',18)}</div>
+      <div style="flex:1;">
+        <div style="font-size:13px;font-weight:800;">${statusOk?'دریافت خودکار فعال است':'در حال اتصال...'}</div>
+        <div id="priceStatus" style="font-size:11.5px;color:var(--muted);margin-top:2px;">آخرین به‌روزرسانی: ${updatedTxt} · هر ۶۰ ثانیه خودکار</div>
+      </div>
+    </div>
+
+    <div class="row-field" style="margin-bottom:16px;cursor:pointer;" id="autoToggleRow">
+      <div class="rf-left">${ic('refresh',16)}<span>دریافت خودکار نرخ لحظه‌ای</span></div>
+      <div id="autoToggleState" style="font-weight:800;color:${state.settings.autoPrices!==false?'var(--teal-700)':'var(--muted-2)'};">${state.settings.autoPrices!==false?'روشن':'خاموش'}</div>
+    </div>
+
     <div class="field"><label>قیمت هر گرم طلا (تومان)</label><input type="number" class="text-input" id="goldRateInput" value="${state.settings.goldPrice||''}" placeholder="مثلاً ۸۰۰۰۰۰۰"></div>
     <div class="field"><label>نرخ هر دلار (تومان)</label><input type="number" class="text-input" id="dollarRateInput" value="${state.settings.dollarRate||''}" placeholder="مثلاً ۱۶۵۰۰۰۰"></div>
+    <div style="font-size:11px;color:var(--muted-2);margin-bottom:18px;line-height:1.8;">این دو عدد به‌صورت خودکار از بازار آزاد به‌روز می‌شن. اگر دریافت خودکار قطع بود یا خواستی خودت عدد دلخواه بدی، همین‌جا دستی ویرایششون کن.</div>
+
+    <div id="advToggleRow" style="font-size:12px;color:var(--teal-700);font-weight:700;cursor:pointer;margin-bottom:14px;">تنظیمات پیشرفته (کلید اختصاصی) ${ic('chevL',13)}</div>
+    <div id="advBox" style="display:none;">
+      <div class="field">
+        <label>کلید اختصاصی BrsApi (اختیاری — فقط برای پایداری بیشتر)</label>
+        <input type="text" class="text-input" id="apiKeyInput" value="${state.settings.brsApiKey||''}" placeholder="در حالت عادی لازم نیست" dir="ltr" style="text-align:left;">
+      </div>
+    </div>
+
     <button class="primary-btn" id="saveRatesBtn">${ic('check',17)} ذخیره</button>
   `);
   bindSheetCommon();
+  document.getElementById('autoToggleRow').onclick = ()=>{
+    state.settings.autoPrices = state.settings.autoPrices===false ? true : false;
+    const el = document.getElementById('autoToggleState');
+    el.textContent = state.settings.autoPrices!==false?'روشن':'خاموش';
+    el.style.color = state.settings.autoPrices!==false?'var(--teal-700)':'var(--muted-2)';
+  };
+  document.getElementById('advToggleRow').onclick = ()=>{
+    const box = document.getElementById('advBox');
+    box.style.display = box.style.display==='none' ? 'block' : 'none';
+  };
   document.getElementById('saveRatesBtn').onclick = async ()=>{
+    state.settings.brsApiKey = (document.getElementById('apiKeyInput')?.value||'').trim();
     state.settings.goldPrice = Number(document.getElementById('goldRateInput').value)||'';
     state.settings.dollarRate = Number(document.getElementById('dollarRateInput').value)||'';
     await saveState(); closeSheet();
+    startPriceAutoRefresh();
   };
 }
 
@@ -933,19 +1079,20 @@ function sheetHistoryDetail(m){
   document.getElementById('printHistBtn').onclick = ()=> printMonthReport(m);
 }
 
-function sheetAddExpense(){
-  editingExpenseCat = 'food';
+function sheetAddExpense(prefill){
+  editingExpenseCat = prefill ? 'other' : 'food';
   openSheet(`
     <div class="sheet-head"><h3>ثبت هزینه جدید</h3><button class="icon-btn" id="closeSheetBtn">${ic('x',16)}</button></div>
+    ${prefill? `<div style="background:var(--teal-100);color:var(--teal-700);font-size:11.5px;font-weight:700;padding:10px 14px;border-radius:12px;margin-bottom:16px;line-height:1.8;">${ic('tag',13)} این مبلغ از متن اشتراک‌گذاشته‌شده خونده شده — لطفاً مبلغ و دسته‌بندی رو بررسی و اصلاح کن.</div>`:''}
     <div class="field">
       <label>مبلغ (تومان)</label>
-      <input type="number" inputmode="numeric" class="amount-input" id="expAmount" placeholder="۰">
+      <input type="number" inputmode="numeric" class="amount-input" id="expAmount" placeholder="۰" value="${prefill && prefill.amount ? prefill.amount : ''}">
     </div>
     <div class="field">
       <label>دسته‌بندی</label>
       <div class="cat-grid" id="catGrid">
         ${EXPENSE_PICKABLE_CATS.map(k=>{ const c=CATS[k]; return `
-          <button type="button" class="cat-item ${k==='food'?'active':''}" data-cat="${k}">
+          <button type="button" class="cat-item ${k===editingExpenseCat?'active':''}" data-cat="${k}">
             <span class="ci-ic" style="background:${c.bg};color:${c.color}">${ic(c.icon,16)}</span>
             <span>${c.label}</span>
           </button>`; }).join('')}
@@ -957,7 +1104,7 @@ function sheetAddExpense(){
     </div>
     <div class="field">
       <label>یادداشت (اختیاری)</label>
-      <input type="text" class="text-input" id="expNote" placeholder="مثلاً سوپرمارکت">
+      <input type="text" class="text-input" id="expNote" placeholder="مثلاً سوپرمارکت" value="${prefill && prefill.note ? prefill.note.replace(/"/g,'&quot;') : ''}">
     </div>
     <button class="primary-btn" id="saveExpenseBtn">${ic('check',17)} ثبت هزینه</button>
   `);
@@ -1165,6 +1312,12 @@ function bindScreenEvents(){
   if(printMonthBtn) printMonthBtn.onclick = ()=> printMonthReport(currentMonthRecord());
   const addAsset = document.getElementById('addAssetBtn');
   if(addAsset) addAsset.onclick = ()=> sheetAddAsset(null);
+  const refreshPricesBtn = document.getElementById('refreshPricesBtn');
+  if(refreshPricesBtn) refreshPricesBtn.onclick = async ()=>{
+    const r = await fetchLivePrices();
+    showToast(r.ok? 'نرخ‌ها به‌روزرسانی شد' : 'ناموفق: '+r.reason);
+    render();
+  };
   const resetBtn = document.getElementById('resetBtn');
   if(resetBtn) resetBtn.onclick = async ()=>{
     if(confirm('همه اطلاعات (شامل تاریخچه ماه‌ها) پاک شود؟')){
